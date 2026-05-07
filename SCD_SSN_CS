@@ -1,0 +1,77 @@
+function [x, history] = SCD_SSN_CS(A, b, x0, s, eta, maxIter, tol)
+% This code aims at solving the Compressive Sensing problem with form
+%
+%         min_{x\in R^n} \|Ax-b\|^2  s.t.  \|x\|_0<=s
+%
+% where s is the given sparsity, which is << n.  
+%--------------------------------------------------------------------------
+%   Input
+%       A : measurement matrix
+%       b: measured vector
+%       x0: initial point
+%       s : sparsity of Sest
+%       eta: assume the solution is an eta-stationary point
+%       maxIter: number of iterations not to be exceeded
+%       tol : tolerance for the norm of resident. 
+%   Output
+%       x: Solution found by the algorithm
+%       history:  stores the residual for each iteration
+% 
+    x = x0(:);
+    n = length(x);
+
+    %c = A' * b;
+    history.residual = zeros(maxIter,1);
+
+    for k = 1:maxIter
+        Tx      = find(x); 
+        Axb     = A(:,Tx)*x(Tx)-b;
+        g   = (Axb'*A)'; 
+        mask = false(n,1);
+        z = x - eta * g;
+        [~, T] = maxk(abs(z), s);
+        mask(T) = true;
+        % 创建 T 的逻辑掩码，用于快速求补集
+        mask_T = false(n, 1);
+        mask_T(T) = true;
+        Tc = find(~mask_T);
+        
+        res_norm = sqrt(sum(g(T).^2) + sum(x(~mask).^2));
+         if ~isempty(Tc)
+            
+            abs_x_sorted = sort(abs(x), 'descend');
+            if length(abs_x_sorted) >= s
+                x_s_val = abs_x_sorted(s);
+            else
+                x_s_val = 0;
+            end
+            
+            threshold = x_s_val / eta;
+
+            g_Tc = abs(g(Tc));
+            
+      
+            violations = max(g_Tc - threshold, 0);
+            
+            if ~isempty(violations)
+                extra_term = max(violations);
+            end
+         end
+         res_norm = res_norm + extra_term;
+        history.residual(k) = res_norm;
+        
+        if res_norm < tol
+            history.residual = history.residual(1:k);
+            fprintf('Converged at iteration %d, residual = %.3e\n', k-1, res_norm);
+            return;
+        end
+        %z = x- eta *A' * (A*x - b);
+
+        x = zeros(n,1);
+        AT = A(:,T);
+        x(T) = (AT' * AT) \ (AT' * b);
+    end
+
+    history.residual = history.residual(1:maxIter);
+    fprintf('Maximum iterations reached, residual = %.3e\n', history.residual(end));
+end
