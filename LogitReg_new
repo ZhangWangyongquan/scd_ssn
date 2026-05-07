@@ -1,0 +1,76 @@
+function [out1, out2] = LogitReg_new(x, T1, T2, data)
+% 调用模式：
+% 1. [f, g] = LogitReg(x, [], [], data)      -> 全量梯度 (用于残差检查)
+% 2. [f, g_T] = LogitReg(x, [], T, data)     -> 仅计算 T 处的梯度分量 (用于牛顿步)
+% 3. H_TT = LogitReg(x, T, [], data)         -> Hessian 子矩阵 (用于牛顿步)
+
+    % --- 1. 计算 Ax (利用稀疏性) ---
+    if nnz(x) >= 0.8 * length(x)
+        Ax = data.A * x;
+    else
+        Tx = find(x);
+        Ax = data.A(:, Tx) * x(Tx);
+    end
+    
+    m   = length(data.b);
+    mu  = 1e-6 / m;
+    
+    % --- 2. 模式判断 ---
+    
+    % 情况 A: 计算 Hessian (T1 不为空)
+    if ~isempty(T1)
+        eAx  = exp(Ax);
+        eXx  = 1 ./ (1 + eAx);
+        d    = eXx .* (1 - eXx) / m; 
+        
+        XT = data.A(:, T1);
+        s  = length(T1);
+        
+        if s < 2000
+            out1 = (d .* XT)' * XT + mu * speye(s);
+        else
+            out1 = @(v)( mu*v + ( (d .* (XT * v))' * XT )' );
+        end
+        
+        if nargout == 2
+             out2 = []; 
+        end
+
+    % 情况 B: 计算目标函数 和 梯度 (T1 为空)
+    else
+        % --- 计算目标函数值 ---
+        eAx = exp(Ax);
+        if sum(eAx) == Inf
+            Tpos = find(Ax > 300);
+            Tneg = setdiff(1:m, Tpos);
+            obj = sum(log(1 + eAx(Tneg))) + sum(Ax(Tpos)) - sum(data.b .* Ax);
+        else
+            obj = sum(log(1 + eAx) - data.b .* Ax);
+            %eNegAx = exp(-Ax);
+            %log_term = Ax + log1p(eNegAx);
+            %obj = sum(log_term - data.b .* Ax, 'all');
+        end
+        out1 = obj / m;
+        
+        % --- 计算梯度 ---
+        if nargout == 2
+            % 1. 先计算残差向量 (m x 1)
+            residual_vec = 1-(1 ./ (1 + eAx)) - data.b; 
+            
+            if isempty(T2)
+                % [模式1] 计算全量梯度
+                grad_full = (data.A' * residual_vec) / m;
+                out2 = grad_full + mu * x;
+            else
+                % [模式2] 只计算 T2 对应的梯度分量 (用于牛顿步)
+                % 核心修正：正则化项必须基于主迭代点 x，而不是中间点 z
+                % 这样才能保证牛顿方向的正确性
+                grad_T = (data.A(:, T2)' * residual_vec) / m;
+                
+                % 【关键修复】这里必须使用传入的完整向量 x 来提取正则化项
+                % 即使我们只计算 T2 部分的梯度，正则化惩罚也应基于全局的 x
+                out2 = grad_T + mu * x(T2);
+            end
+        end
+    end
+end
