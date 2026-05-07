@@ -1,0 +1,74 @@
+clc; clear; close all;
+
+%% Parameters
+numTests = 50;      % number of test instances            % number of rows of A
+n = 25000;  
+m = n/4;% number of columns of A
+s = 0.05*n;               % sparsity level
+
+eta = 10*(1+s/n)/min(10,log(n));
+maxIter = 100;
+tol = 1e-12;          % stopping tolerance for the algorithm
+
+res_tol = 1e-12;      % success criterion: ||Ax-b|| <= res_tol
+
+%% Storage
+times = zeros(numTests,1);
+residuals = zeros(numTests,1);
+rel_errs = zeros(numTests,1);
+success = zeros(numTests,1);
+
+for t = 1:numTests
+    %% Generate normalized Gaussian matrix A
+    A = generate_random_partial_dct_normalized(m,n);
+    for j = 1:n
+        A(:,j) = A(:,j) / norm(A(:,j), 2);
+    end
+
+
+    %% Generate sparse true solution x_true
+    x_true = zeros(n,1);
+    Gamma = randperm(n);
+    x_true(Gamma(1:s)) = randn(s,1);
+
+    %% Construct b = A*x_true
+    b = A * x_true;
+
+    %% Define f(x)=1/2||Ax-b||^2
+    fgrad = @(x) A'*(A*x - b);
+    fhess = @(x) A'*A;
+
+    %% Initial point
+    x0 = zeros(n,1);
+
+    %% Run algorithm
+    tic;
+    [x_sol, hist] = SCD_SSN_quad_large(A, b, x0, s, eta, maxIter, tol);
+    times(t) = toc;
+
+    %% Compute residual and error
+    residuals(t) = norm(A*x_sol - b, 2);
+    rel_errs(t) = norm(x_sol - x_true, 2) / max(norm(x_true,2), 1e-15);
+
+    %% Success criterion
+    if residuals(t) <= res_tol
+        success(t) = 1;
+    end
+
+    fprintf('Test %3d: time = %.4f s, residual = %.3e, rel_err = %.3e, success = %d\n', ...
+        t, times(t), residuals(t), rel_errs(t), success(t));
+end
+
+%% Statistics
+avg_time = mean(times);
+success_rate = mean(success);
+avg_residual = mean(residuals);
+avg_rel_err = mean(rel_errs);
+
+fprintf('\n========== Final Results ==========\n');
+fprintf('Number of tests        : %d\n', numTests);
+fprintf('Average CPU time       : %.6f s\n', avg_time);
+fprintf('Success rate           : %.2f%%\n', 100*success_rate);
+fprintf('Average residual       : %.3e\n', avg_residual);
+fprintf('Average relative error : %.3e\n', avg_rel_err);
+fprintf('Residual tolerance     : %.1e\n', res_tol);
