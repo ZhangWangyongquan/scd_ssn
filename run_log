@@ -1,0 +1,196 @@
+clc; clear; close all;
+    
+    % --- 1. 实验设置 ---
+    %10000, 15000, 20000, 25000, 30000, 35000, 40000
+    n_values = [10000, 15000, 20000, 25000, 30000, 35000, 40000]; % 不同的维度
+    num_runs = 10;                                 % 每个维度运行次数
+    m_ratio  = 1/5;                                % m = n / 5
+    sparsity_ratio = 0.01;                         % s = 0.01 * n
+    
+    % 用于存储结果的表格
+    Results = table();
+
+    fprintf('=============================================================\n');
+    fprintf('开始大规模稀疏逻辑回归数值实验\n');
+    fprintf('维度: %s\n', mat2str(n_values));
+    fprintf('重复次数: %d\n', num_runs);
+    fprintf('=============================================================\n');
+
+    for i_n = 1:length(n_values)
+        n = n_values(i_n);
+        m = ceil(n * m_ratio);
+        s = ceil(n * sparsity_ratio); % 真实稀疏度 k
+        
+        % 初始化统计变量
+        time_NHTP_arr = zeros(num_runs, 1); obj_NHTP_arr = zeros(num_runs, 1); valid_NHTP = 0;
+        time_QA_arr   = zeros(num_runs, 1); obj_QA_arr   = zeros(num_runs, 1); valid_QA   = 0;
+        time_IIHT_arr = zeros(num_runs, 1); obj_IIHT_arr = zeros(num_runs, 1); valid_IIHT = 0;
+        time_SCD_arr  = zeros(num_runs, 1); obj_SCD_arr  = zeros(num_runs, 1); valid_SCD  = 0;
+        
+        fprintf('\n>>> 正在测试 n = %d (m=%d, s=%d) ...\n', n, m, s);
+        
+        for r = 1:num_runs
+            % --- 2. 生成数据 (Case 3: Auto-regressive) ---
+            data = generate_data_case3(n, m, s);
+            theta = 0.5;
+            func = @(x,T1,T2) LogitReg(x, T1, T2, data);
+            
+            % --- 3. 运行算法 ---
+            
+            % === 算法 1: NHTP ===
+            try
+                tic;
+                out = NHTP(func, n, s); 
+                time_NHTP_arr(r) = toc;
+                obj_NHTP_arr(r) = out.obj;
+                valid_NHTP = valid_NHTP + 1;
+            catch
+                warning('NHTP failed at run %d', r);
+            end
+            
+            % === 算法 2: Grasp ===
+            try
+             %options.max_iter = 20; 
+             %options.tol = 1e-3;
+             F = @(x,I)myLogistic(x,data.A(:,I)',data.b);
+             options.mu = -1e-6/m; 
+             options.HvFunc = @(v,x,I)myLogistic_Hv(v,x,data.A(:,I)'); % Hessian-vector product
+             options.maxIter = 100; % max. number of iterations 
+             options.tolF = 1e-6; % progress tol.
+             options.tolG = 0.35; % gradient tol.
+             tic;
+             % 注意：假设 quadratic_approx_logit 返回的是最优目标函数值 f_qa
+             x_qa = GraSP(F,s,n,options);
+             %x_qa=GraSP_LogitReg(data,s,n);
+             time_QA_arr(r) = toc;
+             Tx  = find(x_qa); 
+             Ax  = data.A(:,Tx)*x_qa(Tx); 
+      
+             eAx    = exp(Ax);
+             obj  = sum(log(1+eAx)-data.b.*Ax); 
+             f_qa = obj/m;
+             obj_QA_arr(r)  = f_qa;
+             fprintf('Grasp   -> Time: %.3fs, Loss: %.4e\n', time_QA_arr(r), obj_QA_arr(r));
+             valid_QA = valid_QA + 1;
+             catch ME
+             warning('?? failed at s=%d: %s', s, ME.message);
+            end
+            
+            
+            % === 算法 3: IIHT ===
+            try
+                % 假设 IIHT 返回结构体包含 .time 和 .obj
+                out = IIHT('LR', n, s, data);
+                time_IIHT_arr(r) = out.time;
+                obj_IIHT_arr(r) = out.obj;
+                valid_IIHT = valid_IIHT + 1;
+            catch
+                warning('IIHT failed at run %d', r);
+            end
+            
+            % === 算法 4: SCD ===
+            try
+                x0 = zeros(n, 1);
+                %eta = 10*(1+s/n)/min(10,log(n));
+                eta = s/n;
+                opts = struct('verbose', true); 
+                func_new = @(x,T1,T2) LogitReg_new(x, T1, T2, data); % 确保使用相同的数据
+                
+                tic;
+                % 注意：这里假设 scd_ssn_general_time 返回 [x, info] 或类似结构
+                % 如果它只返回 x，请相应调整
+                [x_scd, ~] = scd_ssn_general_time(x0, eta, s, func_new, opts);
+                time_scd = toc;
+                
+                fprintf('SCD Done. Loss: %.4e, Time: %.3fs\n', func(x_scd, [], []), time_scd);
+                % 计算最终目标值
+                [f_scd, ~] = func(x_scd, [], []);
+                
+                time_SCD_arr(r) = time_scd;
+                obj_SCD_arr(r) = f_scd;
+                valid_SCD = valid_SCD + 1;
+            catch
+                warning('SCD failed at run %d', r);
+            end
+            
+            if mod(r, 10) == 0
+                fprintf('  Run %d/%d completed.\n', r, num_runs);
+            end
+        end
+        
+        % --- 4. 统计当前维度的平均值 ---
+        % 处理空值或失败的情况
+        mean_obj_NHTP = mean(obj_NHTP_arr(1:valid_NHTP));
+        mean_time_NHTP = mean(time_NHTP_arr(1:valid_NHTP));
+        
+        mean_obj_QA = mean(obj_QA_arr(1:valid_QA));
+        mean_time_QA = mean(time_QA_arr(1:valid_QA));
+        
+        mean_obj_IIHT = mean(obj_IIHT_arr(1:valid_IIHT));
+        mean_time_IIHT = mean(time_IIHT_arr(1:valid_IIHT));
+        
+        mean_obj_SCD = mean(obj_SCD_arr(1:valid_SCD));
+        mean_time_SCD = mean(time_SCD_arr(1:valid_SCD));
+        
+        % 添加到表格
+        Results = [Results; {n, mean_obj_NHTP, mean_time_NHTP, ...
+                             mean_obj_QA, mean_time_QA, ...
+                             mean_obj_IIHT, mean_time_IIHT, ...
+                             mean_obj_SCD, mean_time_SCD}];
+        
+        fprintf('-------------------------------------------------------------\n');
+        fprintf('n = %d 完成:\n', n);
+        fprintf('  NHTP: Loss=%.2e, Time=%.2fs\n', mean_obj_NHTP, mean_time_NHTP);
+        fprintf('  QA:   Loss=%.2e, Time=%.2fs\n', mean_obj_QA, mean_time_QA);
+        fprintf('  IIHT: Loss=%.2e, Time=%.2fs\n', mean_obj_IIHT, mean_time_IIHT);
+        fprintf('  SCD:  Loss=%.2e, Time=%.2fs\n', mean_obj_SCD, mean_time_SCD);
+        fprintf('-------------------------------------------------------------\n');
+    end
+    
+    % --- 5. 显示最终结果 ---
+    Results.Properties.VariableNames = {'n', ...
+        'Obj_NHTP', 'Time_NHTP', ...
+        'Obj_Grasp', 'Time_Grasp', ...
+        'Obj_IIHT', 'Time_IIHT', ...
+        'Obj_SCD', 'Time_SCD'};
+    
+    disp('所有实验完成。最终平均结果：');
+    disp(Results);
+
+
+%% --- 辅助函数：数据生成 (Case 3) ---
+function data = generate_data_case3(n, m, s)
+    theta = 0.5;
+    
+    
+    % 生成稀疏参数 x_star
+    x_star = zeros(n, 1);
+    I = randperm(n);
+    T = I(1:s);
+    x_star(T) = randn(s, 1);
+    
+    % 生成数据样本 A (自回归)
+    data.A = zeros(m, n);
+    for i = 1:m
+        data.A(i, 1) = randn();
+        for j = 1:n-1
+            v_ij = randn();
+            data.A(i, j+1) = theta * data.A(i, j) + sqrt(1 - theta^2) * v_ij;
+        end
+    end
+    
+    % 生成标签 b
+    linear_comb = data.A * x_star;
+    prob_y_is_0 = 1 ./ (1 + exp(linear_comb));
+    
+    data.b = zeros(m, 1);
+    for i = 1:m
+        if rand() < prob_y_is_0(i)
+            data.b(i) = 0;
+        else
+            data.b(i) = 1;
+        end
+    end
+end
+%profile off
+%profile viewer
