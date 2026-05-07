@@ -1,0 +1,221 @@
+function [x, out] = scd_ssn_general(x0, eta, s, func, opts)
+% SCD SSN general_version
+% This algorithm aims at solving the sparsity constrained optimization with form
+%
+%         min_{x\in R^n} f(x)  s.t.  \|x\|_0<=s
+%
+% where s is the given sparsity, which is << n. 
+%--------------------------------------------------------------------------
+% Inputs:
+%   x0    - (Vector) Initial guess for the solution vector.
+%   eta   - (Scalar) Step size parameter used for the gradient descent step 
+%           (calculating z) and the thresholding value.
+%   s     - (Integer) Sparsity level.
+%   func  - (Function Handle) A handle to the objective function. It should 
+%           support calls to return the function value, gradient, and Hessian 
+%           (or Hessian-vector product) based on the input arguments.
+%   opts  - (Struct) Structure containing algorithm options. Fields include:
+%             .maxit   : Maximum number of iterations (Default: 100)
+%             .tol     : Convergence tolerance (Default: 1e-6)
+%             .verbose : Boolean flag to print iteration details (Default: true)
+%             .reg     : Regularization parameter (Default: 1e-6)
+%             .nhtp_tol_factor : Factor for SCD_ssn tolerance (Default: 0.1)
+%             .cg_maxit: Maximum iterations for the Conjugate Gradient solver (Default: 50)
+%
+% Outputs:
+%   x     - (Vector) The sparse solution x.
+%   out   - (Struct) Structure containing the algorithm's execution history:
+%             .xhist   : Matrix storing the solution vector at each iteration.
+%             .res     : Vector of residual values at each iteration.
+%             .obj     : Vector of objective function values at each iteration.
+%             .Tset    : Cell array storing the support set indices (T) for each iteration.
+%             .timing  : Struct containing time elapsed for different computational steps.
+%             .iter    : Total number of iterations performed.
+%             .exitflag: Integer indicating the exit condition (1: tolerance met, 2: obj change small, 0: max iter reached).
+
+
+    if nargin < 5
+        opts = struct();
+    end
+
+    % --- 默认参数设置 ---
+    if ~isfield(opts, 'maxit'),   opts.maxit = 100; end
+    if ~isfield(opts, 'tol'),     opts.tol = 1e-6; end
+    if ~isfield(opts, 'verbose'), opts.verbose = true; end
+    if ~isfield(opts, 'reg'),     opts.reg = 1e-6; end
+    if ~isfield(opts, 'nhtp_tol_factor'), opts.nhtp_tol_factor = 0.1; end 
+    if ~isfield(opts, 'cg_maxit'),    opts.cg_maxit = 50; end
+
+    x = x0(:);
+    n = length(x);
+
+    % 初始化输出结构
+    out.xhist = zeros(n, opts.maxit + 1);
+    out.xhist(:,1) = x;
+    out.res = zeros(opts.maxit, 1);
+    out.obj = zeros(opts.maxit + 1, 1); 
+    out.Tset = cell(opts.maxit, 1);
+    
+    % --- 保留 timing 结构体 ---
+    out.timing = struct('total', zeros(opts.maxit, 1), ...
+                        'step1_z', zeros(opts.maxit, 1), ...
+                        'step2_T', zeros(opts.maxit, 1), ...
+                        'step3_res', zeros(opts.maxit, 1), ...
+                        'calc_grad', zeros(opts.maxit, 1), ...
+                        'calc_hess', zeros(opts.maxit, 1), ...
+                        'solve_sys', zeros(opts.maxit, 1), ...
+                        'step5_update', zeros(opts.maxit, 1));
+    
+    out.iter = 0;
+    out.exitflag = 0;
+
+    % --- 初始计算 ---
+    [fval, g] = func(x, [], []);
+    out.obj(1) = fval;
+
+    for k = 1:opts.maxit
+        
+        % --- Step 1: 计算 z ---
+        z = x - eta * g;
+        
+        % --- Step 2: 支撑集选择 ---
+        [~, T] = maxk(abs(z), s);
+        out.Tset{k} = T;
+
+        % --- Step 3: 计算残差 (已修改) ---
+        
+        % 1. 基础部分：||grad_f(x)||_2
+        grad_T_norm_sq = norm(g(T), 2)^2;
+        
+        % 利用恒等式 ||g||^2 = ||g(T)||^2 + ||g(Tc)||^2 避免显式计算 Tc
+        x_T_norm_sq = norm(x(T), 2)^2;
+        x_total_norm_sq = norm(x, 2)^2;
+        grad_Tc_norm_sq = x_total_norm_sq - x_T_norm_sq;
+        
+        base_residual = sqrt(grad_T_norm_sq + grad_Tc_norm_sq);
+
+        % 2. 新增惩罚项：max_{i in Tc} { max(|grad_i| - x(s)/eta, 0) }
+        penalty_term = 0;
+        
+        % 计算 x(s)：x 中第 s 大的绝对值
+        abs_x_sorted = sort(abs(x), 'descend');
+        if length(abs_x_sorted) >= s
+            x_s_val = abs_x_sorted(s);
+        else
+            x_s_val = 0;
+        end
+        
+        threshold = x_s_val / eta;
+        
+        % 获取 Tc (补集) 的索引
+        mask_T = false(n, 1);
+        mask_T(T) = true;
+        g_Tc = abs(g(~mask_T)); % 提取补集上的梯度绝对值
+        
+        if ~isempty(g_Tc)
+            % 计算违规量并取最大值
+            violations = max(g_Tc - threshold, 0);
+            if ~isempty(violations)
+                penalty_term = max(violations);
+            end
+        end
+        
+        % 3. 总残差
+        res = base_residual + penalty_term;
+        
+        out.res(k) = res;
+
+        if opts.verbose
+            fprintf('Iter %3d: res=%.3e, obj=%.5e, ', k-1, res, out.obj(k));
+        end
+
+        % --- 停止条件 1 ---
+        if res < opts.tol
+            out.iter = k - 1;
+            out.exitflag = 1;
+            break;
+        end
+
+        % --- Step 4: Newton Step ---
+        hatd = zeros(n,1);
+        hatd(T) = z(T);
+        Delta = zeros(n,1);
+
+        if ~isempty(T)
+            % 计算梯度
+            [~, gd] = func(z, [], T); 
+            
+            % 计算 Hessian
+            H_sub = func(z, T, []);
+            
+            % 精度设置
+            cg_tol_nhtp = opts.nhtp_tol_factor * opts.tol * length(T);
+            cg_tol_nhtp = max(cg_tol_nhtp, 1e-14);
+
+            % 求解线性系统
+            if isa(H_sub, 'function_handle')
+                d_sol = my_cg(H_sub, -gd, cg_tol_nhtp, opts.cg_maxit, zeros(length(T), 1));
+            else
+                d_sol = H_sub \ -gd;
+            end
+            
+            Delta(T) = d_sol;
+        end
+
+        % --- Step 5: 更新与评估 ---
+        x_new = hatd + Delta;
+       
+        % 计算新点的目标函数和梯度
+        [fval_new, g_new] = func(x_new, [], []);
+        out.obj(k+1) = fval_new;
+        
+        obj_change = abs(fval_new - out.obj(k));
+        
+        if opts.verbose
+            fprintf('obj_chg=%.3e\n', obj_change);
+        end
+        
+        if obj_change < opts.tol*(1+abs(out.obj(k)))
+            x = x_new; 
+            out.xhist(:,k+1) = x;
+            out.iter = k;
+            out.exitflag = 2; 
+            break;
+        end
+        % 更新状态
+        x = x_new;
+        g = g_new; 
+        out.xhist(:,k+1) = x;
+    end
+
+    % --- 结果整理 ---
+    if out.exitflag == 0
+        out.iter = opts.maxit;
+    end
+    
+    out.xhist = out.xhist(:,1:out.iter+1);
+    out.res = out.res(1:out.iter);
+    out.obj = out.obj(1:out.iter+1);
+    out.Tset = out.Tset(1:out.iter);
+end
+
+% --- 辅助函数：CG ---
+function x = my_cg(fx,b,cgtol,cgit,x)
+    if ~isa(fx,'function_handle'); fx = @(v)fx*v; end
+    r = b;
+    if nnz(x)>0; r = b - fx(x);  end
+    e = norm(r,'fro')^2;
+    t = e;
+    p = r;
+    for i = 1:cgit  
+        if e < cgtol*t; break; end
+        w  = fx(p);
+        pw = p.*w;
+        a  = e/sum(pw(:));
+        x  = x + a * p;
+        r  = r - a * w;
+        e0 = e;
+        e  = norm(r,'fro')^2;
+        p  = r + (e/e0)*p;
+    end 
+end
